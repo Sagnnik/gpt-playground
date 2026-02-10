@@ -12,8 +12,7 @@ import math
 # TF32 takes the exponent of FP32(8 Bits) but Mantissa of FP16(10bits). Eg: 6.23 (Mantissa/precision) * 10^8 (exponent)
 # This reduces the precision of the calculation but increases the speed.
 torch.backends.cuda.matmul.allow_tf32 = True # Allows the TF32 format matmul.
-torch.backends.cudnn.allow_tf32 = True # Not needed normally for transformers since this only optmizes for convolutions
-torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.benchmark = True # Gives better kernel selection
 torch.set_float32_matmul_precision("high")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -79,6 +78,8 @@ data = encode(text)
 split = int(0.9*len(data))
 train_data = data[:split]
 val_data = data[split:]
+print(f"Total Training tokens: {len(train_data) // 1000000:.2f}M")
+print(f"Total Validation tokens: {len(val_data) // 1000:.2f}K")
 
 def get_batch(split:str='train'):
     src = train_data if split=="train" else val_data
@@ -180,10 +181,22 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList([Block() for _ in range(num_layers)])
         self.ln_f = nn.LayerNorm(n_embed)
         self.head = nn.Linear(n_embed, vocab_size, bias=False)
+        # Tying the head weights to the token embeddings to avoid the need for a separate weight matrix
+        self.head.weight = self.token_embed.weight
+
+        # GPT-2 style initialization of Linear and embedding layers
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, x, y=None, kv_cache=None, start_pos=0):
         B, T = x.shape
         pos = torch.arange(start_pos, start_pos + T, device=x.device)
+        pos = pos.clamp(max=block_size - 1) # To prevent out of bounds error
         x = self.token_embed(x) + self.pos_embed(pos)
 
         for i, block in enumerate(self.blocks):
@@ -241,12 +254,22 @@ def estimate_loss(model):
     return out
 
 def save_checkpoint(model, optimizer, scaler, epoch, losses, filepath):
+    if scaler is not None:
+        scaler_state_dict = scaler.state_dict()
+    else:
+        scaler_state_dict = None
+
+    if scheduler is not None:
+        scheduler_state_dict = scheduler.state_dict()
+    else:
+        scheduler_state_dict = None
+
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'scaler_state_dict': scaler.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(), 
+        'scaler_state_dict': scaler_state_dict,
+        'scheduler_state_dict': scheduler_state_dict, 
         'train_loss': losses['train'],
         'val_loss': losses['val'],
         'hyperparams': {
@@ -267,7 +290,7 @@ def save_checkpoint(model, optimizer, scaler, epoch, losses, filepath):
     torch.save(checkpoint, filepath)
     print(f"Checkpoint saved to {filepath}")
 
-def load_checkpoint(filepath, model, optimizer=None, scaler=None):
+def load_checkpoint(filepath, model, optimizer=None, scaler=None, scheduler=None):
     checkpoint = torch.load(filepath, map_location=device)
 
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -307,6 +330,7 @@ def get_lr(step):
 
 # Training 
 model = GPT().to(device)
+print(f"Model parameters:  {sum(p.numel() for p in model.parameters())/1e6:.4f}M")
 # torch.compile enables kernel fusion; multiple operations are fused into a single kernel for better performance.
 # max-autotune is the best but very slow for the first few batches. creates custom triton kernels. This would be the fastest but RTX 3060 doesn't have enough SMs to run it.
 # max-autotune-no-cudagraphs is useful if you hit OOMs
@@ -316,24 +340,28 @@ model = torch.compile(model, mode="default")
 
 # fused=True is used to use the fused AdamW optimizer which is faster and uses less memory. Only available for certain GPUs.
 # It reads the weights, gradients m, v, updates the weights in one go
-optimizer = torch.optim.AdamW(model.parameters(), lr=max_lr, fused=True)
+optimizer = torch.optim.AdamW(model.parameters(), lr=max_lr, fused=True, betas=(0.9, 0.95))
 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=get_lr)
 # GradScaler is used to scale the gradients before backprop to avoid vanishing gradients with FP16 training
-scaler = torch.amp.GradScaler("cuda")
+# Only needed for FP16 and not for BF16 training
+training_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+print("Training dtype: ", training_dtype)
+scaler = torch.amp.GradScaler("cuda") if training_dtype == torch.float16 else None
 
-# start_epoch = load_checkpoint(path, model, optimizer, scaler)
+# start_epoch = load_checkpoint(path, model, optimizer, scaler, scheduler)
 start = time.time()
 
 for step in trange(epochs, desc="Training"):
+    t0 = time.time()
     if step% eval_interval == 0:
         losses = estimate_loss(model)
-        print(f"{step}: train {losses['train']:.4f}, val {losses['val']:.4f}")
+        #print(f"{step}: train {losses['train']:.4f}, val {losses['val']:.4f}")
         wandb.log(losses | {"step": step})
 
     x, y = get_batch('train')
 
-    # bfloat16 is good enough for training this model
-    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+    # bfloat16 is good for training this model
+    with torch.amp.autocast("cuda", dtype=training_dtype):
         _, loss = model(x, y)
 
     # Log training loss more frequently
@@ -344,16 +372,24 @@ for step in trange(epochs, desc="Training"):
     # with set_to_none=True, it will set the gradient to None after adding the gradient
     optimizer.zero_grad(set_to_none=True)
 
-    scaler.scale(loss).backward()
-    # Gradient clipping is used to prevent exploding spikes in gradients
-    # GradScaler multiplies the gradients by a scale factor to prevent small gradients from vanishing
-    # You need to scale them down before clipping
-    scaler.unscale_(optimizer)
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) 
+    if scaler is not None:
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        loss.backward()
+        norm =torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
 
-    scaler.step(optimizer)
     scheduler.step()
-    scaler.update()
+    
+    t1 = time.time()
+    dt = (t1-t0)*1000
+    tokens_per_second = batch_size * block_size / (t1-t0)
+    # print(f"Step: {step} | loss: {loss.item():.4f} | norm: {norm:.4f} | Time taken: {dt:.2f}ms | tok/sec: {tokens_per_second:.2f}")
+    wandb.log({"time_per_step_in_ms": dt, "tokens_per_second": tokens_per_second, "norm": norm.item()})
 
 end = time.time()
 print(f"Training time: {end - start:.2f}s")
