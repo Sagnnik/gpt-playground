@@ -25,7 +25,7 @@ checkpoint_interval = 1000
 # Hyperparams
 batch_size = 64
 block_size = 256
-epochs = 5000
+epochs = 1000
 eval_interval=500
 #lr = 3e-4
 max_lr = 3e-4
@@ -351,11 +351,12 @@ scaler = torch.amp.GradScaler("cuda") if training_dtype == torch.float16 else No
 # start_epoch = load_checkpoint(path, model, optimizer, scaler, scheduler)
 start = time.time()
 
-for step in trange(epochs, desc="Training"):
+# for step in trange(epochs, desc="Training"):
+for step in range(epochs):
     t0 = time.time()
-    if step% eval_interval == 0:
-        losses = estimate_loss(model)
-        print(f"{step}: train {losses['train']:.4f}, val {losses['val']:.4f}")
+    # if step% eval_interval == 0:
+    #     losses = estimate_loss(model)
+    #     print(f"{step}: train {losses['train']:.4f}, val {losses['val']:.4f}")
         #wandb.log(losses | {"step": step})
 
     x, y = get_batch('train')
@@ -388,7 +389,7 @@ for step in trange(epochs, desc="Training"):
     t1 = time.time()
     dt = (t1-t0)*1000
     tokens_per_second = batch_size * block_size / (t1-t0)
-    # print(f"Step: {step} | loss: {loss.item():.4f} | norm: {norm:.4f} | Time taken: {dt:.2f}ms | tok/sec: {tokens_per_second:.2f}")
+    print(f"Step: {step} | loss: {loss.item():.4f} | norm: {norm:.4f} | Time taken: {dt:.2f}ms | tok/sec: {tokens_per_second:.2f}")
     #wandb.log({"time_per_step_in_ms": dt, "tokens_per_second": tokens_per_second, "norm": norm.item()})
 
 end = time.time()
@@ -401,6 +402,6 @@ losses = estimate_loss(model)
 #print(f"Final checkpoint saved to {final_checkpoint_path}")
 print(f"Training loss: {losses['train']:.4f} | Validation loss: {losses['val']:.4f}")
 
-context = torch.zeros((1,1), dtype=torch.long, device=device)
-out_decoded = decode(model.generate(context, 500)[0].tolist())
-print(out_decoded)
+# context = torch.zeros((1,1), dtype=torch.long, device=device)
+# out_decoded = decode(model.generate(context, 500)[0].tolist())
+# print(out_decoded)
