@@ -13,13 +13,24 @@ import tqdm
 import os
 from pathlib import Path
 
-# Jax performance flag
-# Affects all matmuls that dont specify precision
-# In this case I am mentioning all the bfloat16 operations specifically, so this flag is not really needed.
+# JAX Performance Flags
+# Enable XLA optimizations for GPU
+os.environ['XLA_FLAGS'] = (
+    '--xla_gpu_enable_triton_gemm=true '
+    '--xla_gpu_enable_cudnn_fmha=true '
+    #'--xla_gpu_enable_async_collectives=true'
+)
+# Ensure 32-bit mode (not 64-bit which is slower)
+jax.config.update('jax_enable_x64', False)
+# Set default matmul precision to bfloat16 for speed
 jax.config.update('jax_default_matmul_precision', 'bfloat16')
+# Enable persistent compilation cache (speeds up subsequent runs)
+jax.config.update('jax_compilation_cache_dir', '/tmp/jax_cache')
+jax.config.update('jax_persistent_cache_min_entry_size_bytes', -1)
 PARAM_DTYPE = jnp.float32 # Weights are stored in float32
 COMPUTE_DTYPE = jnp.bfloat16 # Computations are performed in bfloat16
-# check which layers need bfloat16: https://docs.pytorch.org/docs/stable/amp.html#cpu-ops-that-can-autocast-to-bfloat16
+# This matches PyTorch's autocast behavior: matmuls, convs, and LayerNorm in bfloat16
+# Reference: https://docs.pytorch.org/docs/stable/amp.html#cpu-ops-that-can-autocast-to-bfloat16
 
 # Hyperparameters
 @dataclass
@@ -33,7 +44,7 @@ class GPTConfig:
 
 @dataclass
 class TrainingConfig:
-    epochs: int = 5000
+    epochs: int = 1000
     eval_interval: int = 500
     eval_epochs: int = 200
     max_lr: float = 3e-4
@@ -90,7 +101,7 @@ class MultiHeadAttention(nn.Module):
     dropout: float
 
     @nn.compact
-    def __call__(self, x, cache=None, train:bool=True):
+    def __call__(self, x, train: bool = True):
         B, T, C = x.shape
         assert self.n_embed % self.num_heads == 0
         assert C == self.n_embed
@@ -140,15 +151,15 @@ class Block(nn.Module):
 
     @nn.compact
     def __call__(self, x, train: bool = True):
-        norm_x = nn.LayerNorm()(x)
+        norm_x = nn.LayerNorm(dtype=COMPUTE_DTYPE, param_dtype=PARAM_DTYPE)(x)
         attn_out = MultiHeadAttention(
-            n_embed=self.n_embed, 
-            num_heads=self.num_heads, 
+            n_embed=self.n_embed,
+            num_heads=self.num_heads,
             dropout=self.dropout,
         )(norm_x, train=train)
         x = x + attn_out
 
-        norm_x = nn.LayerNorm()(x)
+        norm_x = nn.LayerNorm(dtype=COMPUTE_DTYPE, param_dtype=PARAM_DTYPE)(x)
         ffn_out = FeedForward(n_embed=self.n_embed, dropout=self.dropout)(norm_x, train=train)
         x = x + ffn_out
         return x
@@ -191,10 +202,11 @@ class GPT(nn.Module):
                 dropout=self.config.dropout,
             )(x, train=train)
 
-        x = nn.LayerNorm(dtype=jnp.float32, param_dtype=jnp.float32)(x)
+        x = nn.LayerNorm(dtype=COMPUTE_DTYPE, param_dtype=PARAM_DTYPE)(x)
         # logits = nn.Dense(self.vocab_size, use_bias=False, dtype=COMPUTE_DTYPE, param_dtype=PARAM_DTYPE)(x)
         # Weights tying using the same token_embedd_table (transpose) for the output projections
         # .embedding holds the (vocab_size, n_embed) matrix
+        # Note: x is in bfloat16, embedding is in float32, result will be float32 (good for numerical stability)
         logits = x @ token_embed_table.embedding.T # (B, T, vocab_size)
         return logits
 
@@ -202,10 +214,16 @@ class GPT(nn.Module):
 # DataLoading
 def get_batch(key, split, train_data, val_data, config):
     src = train_data if split == "train" else val_data
-    ix = jrandom.randint(key, shape=(config.batch_size,), minval=0, maxval=len(src) - config.block_size - 1)
-    # there is an option to use dynamic update dim
-    x = src[ix[:, None] + jnp.arange(config.block_size)]
-    y = src[ix[:, None] + jnp.arange(1, config.block_size + 1)]
+    ix = jrandom.randint(
+        key,
+        shape=(config.batch_size,),
+        minval=0,
+        maxval=len(src) - config.block_size - 1,
+    )
+    # Use jnp.arange once and reuse
+    offs = jnp.arange(config.block_size)
+    x = src[ix[:, None] + offs]
+    y = src[ix[:, None] + offs + 1]
     return x, y
 
 
@@ -224,8 +242,10 @@ def make_train_step(model, tx):
     @jax.jit
     def train_step(params, opt_state, x,y, dropout_key):
         def loss_fn(params):
-            logits = model.apply(params, x, train=True, rngs={"dropout": dropout_key}) # Supply the PRNG for all dropout operations
-            
+            logits = model.apply(
+                params, x, train=True, rngs={"dropout": dropout_key}
+            )  # Supply the PRNG for all dropout operations
+
             logits = logits.astype(jnp.float32) # Convert back to float32 for loss computation
             # we need to reshape the logits and y similar to pytorch
             loss = optax.softmax_cross_entropy_with_integer_labels(
@@ -257,15 +277,14 @@ def make_eval_step(model):
 def estimate_loss(eval_step_fn, params, key, train_data, val_data, config, training_config):
     out={}
     for split_name in ['train', 'val']:
-        total_loss = 0.0
+        losses = []
         for _ in range(training_config.eval_epochs):
             key, batch_key = jrandom.split(key)
             x, y = get_batch(batch_key, split_name, train_data, val_data, config)
             loss = eval_step_fn(params, x, y)
-            # .item() acts as a sync barrier that keeps JAX's async dispatch queue drained.
-            # Removing it causes progressive slowdown from unbounded queue growth.
-            total_loss += loss.item()
-        out[split_name] = total_loss / training_config.eval_epochs
+            losses.append(loss)
+        losses = jnp.stack(losses)
+        out[split_name] = losses.mean().item()
     return out, key # return the new key to continue the PRNG sequence
 
 # Generation
@@ -424,17 +443,17 @@ def train():
 
     # Train
     start_time = time.time()
-    for step in tqdm.trange(start_step, training_config.epochs, desc="Training"):
-    # for step in range(start_step, training_config.epochs):
+    #for step in tqdm.trange(start_step, training_config.epochs, desc="Training"):
+    for step in range(start_step, training_config.epochs):
         t0 = time.time()
-
+        
         # Periodic evaluation
-        if step % training_config.eval_interval == 0:
-            losses, key = estimate_loss(
-                eval_step_fn, params, key,
-                train_data, val_data, config, training_config,
-            )
-            print(f"\nStep {step}: train {losses['train']:.4f}, val {losses['val']:.4f}")
+        # if step % training_config.eval_interval == 0:
+        #     losses, key = estimate_loss(
+        #         eval_step_fn, params, key,
+        #         train_data, val_data, config, training_config,
+        #     )
+        #     print(f"\nStep {step}: train {losses['train']:.4f}, val {losses['val']:.4f}")
 
             # # Save checkpoint
             # ckpt_manager.save(
@@ -451,10 +470,12 @@ def train():
         x, y = get_batch(batch_key, "train", train_data, val_data, config)
 
         loss, params, opt_state = train_step_fn(params, opt_state, x, y, dropout_key)
-
+        loss.block_until_ready()
+        
         t1 = time.time()
+        dt_ms = (t1 - t0) * 1000
         tokens_per_sec = config.batch_size * config.block_size / (t1 - t0)
-        #print(f"step {step} | loss {loss:.4f} | dt {t1 - t0:.2f}s | tok/sec {tokens_per_sec:.2f}")
+        print(f"step {step} | loss {loss:.4f} | dt {dt_ms:.2f}ms | tok/sec {tokens_per_sec:.2f}")
 
     elapsed = time.time() - start_time
     print(f"\nTraining time: {elapsed:.2f}s")
@@ -467,10 +488,10 @@ def train():
     print(f"Final — train: {losses['train']:.4f}, val: {losses['val']:.4f}")
 
     # Generate
-    key, gen_key = jrandom.split(key)
-    context = jnp.zeros((1, 1), dtype=jnp.int32)
-    generated = generate(model, params, gen_key, context, 500, config)
-    print(decode(generated[0].tolist()))
+    # key, gen_key = jrandom.split(key)
+    # context = jnp.zeros((1, 1), dtype=jnp.int32)
+    # generated = generate(model, params, gen_key, context, 500, config)
+    # print(decode(generated[0].tolist()))
 
     # Save the final checkpoint
     # ckpt_manager.save(
