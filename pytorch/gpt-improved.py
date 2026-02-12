@@ -40,25 +40,25 @@ num_heads = 6
 num_layers = 6
 dropout = 0.2
 
-wandb.init(
-    project="gpt-run",
-    name=f"improved_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-    config={
-        'batch_size': batch_size,
-        'block_size': block_size,
-        'epochs': epochs,
-        'eval_interval': eval_interval,
-        'max_lr': max_lr,
-        'min_lr': min_lr,
-        'warmup_epochs': warmup_epochs,
-        'lr_decay_epochs': lr_decay_epochs,
-        'n_embed': n_embed,
-        'num_heads': num_heads,
-        'num_layers': num_layers,
-        'dropout': dropout,
-    }
-)
-print(f"Wandb initialized. View at: {wandb.run.url}")
+# wandb.init(
+#     project="gpt-run",
+#     name=f"improved_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+#     config={
+#         'batch_size': batch_size,
+#         'block_size': block_size,
+#         'epochs': epochs,
+#         'eval_interval': eval_interval,
+#         'max_lr': max_lr,
+#         'min_lr': min_lr,
+#         'warmup_epochs': warmup_epochs,
+#         'lr_decay_epochs': lr_decay_epochs,
+#         'n_embed': n_embed,
+#         'num_heads': num_heads,
+#         'num_layers': num_layers,
+#         'dropout': dropout,
+#     }
+# )
+# print(f"Wandb initialized. View at: {wandb.run.url}")
 
 torch.manual_seed(1337)
 torch.cuda.manual_seed(1337)
@@ -355,8 +355,8 @@ for step in trange(epochs, desc="Training"):
     t0 = time.time()
     if step% eval_interval == 0:
         losses = estimate_loss(model)
-        #print(f"{step}: train {losses['train']:.4f}, val {losses['val']:.4f}")
-        wandb.log(losses | {"step": step})
+        print(f"{step}: train {losses['train']:.4f}, val {losses['val']:.4f}")
+        #wandb.log(losses | {"step": step})
 
     x, y = get_batch('train')
 
@@ -389,16 +389,16 @@ for step in trange(epochs, desc="Training"):
     dt = (t1-t0)*1000
     tokens_per_second = batch_size * block_size / (t1-t0)
     # print(f"Step: {step} | loss: {loss.item():.4f} | norm: {norm:.4f} | Time taken: {dt:.2f}ms | tok/sec: {tokens_per_second:.2f}")
-    wandb.log({"time_per_step_in_ms": dt, "tokens_per_second": tokens_per_second, "norm": norm.item()})
+    #wandb.log({"time_per_step_in_ms": dt, "tokens_per_second": tokens_per_second, "norm": norm.item()})
 
 end = time.time()
 print(f"Training time: {end - start:.2f}s")
 
-final_checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_final.pth")
+#final_checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_final.pth")
 losses = estimate_loss(model)
-save_checkpoint(model, optimizer, scaler, epochs, losses, final_checkpoint_path)
-wandb.finish()
-print(f"Final checkpoint saved to {final_checkpoint_path}")
+#save_checkpoint(model, optimizer, scaler, epochs, losses, final_checkpoint_path)
+#wandb.finish()
+#print(f"Final checkpoint saved to {final_checkpoint_path}")
 print(f"Training loss: {losses['train']:.4f} | Validation loss: {losses['val']:.4f}")
 
 context = torch.zeros((1,1), dtype=torch.long, device=device)
