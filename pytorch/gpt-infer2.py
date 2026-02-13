@@ -49,16 +49,16 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_size = n_embed // num_heads
-
-        self.qkv = nn.Linear(n_embed, 3 * n_embed, bias=False)
+        
+        self.qkv = nn.Linear(n_embed, 3*n_embed, bias=False) # Because of layer norm the effect of bias is cancelled out
         self.proj = nn.Linear(n_embed, n_embed, bias=False)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, kv_cache=None):
         B, T, C = x.shape
-
-        qkv = self.qkv(x)
-        qkv = qkv.view(B, T, 3, self.num_heads, self.head_size).transpose(1, 3)
-        q, k, v = qkv.unbind(dim=2)
+        qkv = self.qkv(x) # (B, T, 3*n_embed) and n_embed = head_size * num_heads
+        qkv = qkv.view(B, T, 3, self.num_heads, self.head_size).transpose(1,3) # (B, T, 3, nh, hs) --> (B, nh, 3, T, hs)
+        q, k, v = qkv.unbind(dim=2) # (B, nh, T, hs)
 
         # Determine if we should use causal masking
         # Only use is_causal when cache is empty (first forward pass)
@@ -72,22 +72,29 @@ class MultiHeadAttention(nn.Module):
                 kv_cache["v"] = torch.cat([kv_cache["v"], v], dim=2)
             k, v = kv_cache["k"], kv_cache["v"]
 
+        # use the scaled dot product attention for Flash Attention Kernels
         out = F.scaled_dot_product_attention(
-            q, k, v,
-            is_causal=use_causal,
-            dropout_p=0.0
-        )
+            q, k, v, 
+            is_causal=use_causal, 
+            dropout_p=dropout if self.training else 0.0
+            ) # (B, nh, T, hs)
 
-        out = out.transpose(1, 2).contiguous().view(B, T, C)
-        return self.proj(out)
+        # .transpose does not move the numbers around in RAM which will give an error in .view() operation
+        # it will throw-> RuntimeError: input is not contiguous
+        # .contiguous() makes the tensor contiguous in memory.
+        out = out.transpose(1, 2).contiguous().view(B, T, C) # (B, nh, T, hs) --> (B, T, C)
+        return self.dropout(self.proj(out))
 
 class FeedForward(nn.Module):
     def __init__(self):
         super().__init__()
+        # There is a 4x expansion in the hidden dimension.
+        # Using GELU instead of ReLU for better performance.
         self.net = nn.Sequential(
-            nn.Linear(n_embed, 4 * n_embed, bias=False),
+            nn.Linear(n_embed, 4*n_embed, bias=False),
             nn.GELU(),
-            nn.Linear(4 * n_embed, n_embed, bias=False),
+            nn.Linear(4*n_embed, n_embed, bias=False),
+            nn.Dropout(dropout)
         )
 
     def forward(self, x):
@@ -102,8 +109,14 @@ class Block(nn.Module):
         self.ffn = FeedForward()
 
     def forward(self, x, kv_cache=None):
-        x = x + self.mha(self.ln1(x), kv_cache)
-        x = x + self.ffn(self.ln2(x))
+        # 1. Layer Norm
+        # 2. Multi Head Attention
+        # 3. Skip Connection
+        # 4. Layer Norm
+        # 5. Feed Forward
+        # 6. Skip Connection
+        x = x+ self.mha(self.ln1(x), kv_cache)
+        x = x+ self.ffn(self.ln2(x))
         return x
 
 class GPT(nn.Module):
@@ -114,17 +127,36 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList([Block() for _ in range(num_layers)])
         self.ln_f = nn.LayerNorm(n_embed)
         self.head = nn.Linear(n_embed, vocab_size, bias=False)
+        # Tying the head weights to the token embeddings to avoid the need for a separate weight matrix
+        self.head.weight = self.token_embed.weight
 
-    def forward(self, x, kv_cache=None, start_pos=0):
+        # GPT-2 style initialization of Linear and embedding layers
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, x, y=None, kv_cache=None, start_pos=0):
         B, T = x.shape
         pos = torch.arange(start_pos, start_pos + T, device=x.device)
+        pos = pos.clamp(max=block_size - 1) # To prevent out of bounds error
         x = self.token_embed(x) + self.pos_embed(pos)
 
         for i, block in enumerate(self.blocks):
-            x = block(x, kv_cache[i] if kv_cache else None)
+            cache = None if kv_cache is None else kv_cache[i]
+            x = block(x, cache)
 
         x = self.ln_f(x)
-        return self.head(x)
+        logits = self.head(x)
+
+        if y is None:
+            return logits, None
+
+        loss = F.cross_entropy(logits.view(B*T, vocab_size), y.view(B*T))
+        return logits, loss
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0):
@@ -150,6 +182,27 @@ class GPT(nn.Module):
             idx = torch.cat([idx, next_idx], dim=1)
 
         return idx
+    
+    @torch.no_grad()
+    def generate2(self, idx, max_new_tokens, temperature=1.0):
+        """Sliding window attention for inference"""
+        self.eval()
+        B = idx.shape[0]
+        for _ in range(max_new_tokens):
+            # Sliding window
+            idx_cond = idx[:, -block_size:]  # crop to context window
+            # Forward pass (no kv cache)
+            logits, _ = self(idx_cond)
+            # Take last token logits
+            logits = logits[:, -1, :] / temperature
+            # Convert to probabilities
+            probs = torch.softmax(logits, dim=-1)
+            # Sample next token
+            next_idx = torch.multinomial(probs, num_samples=1)
+            # Append to sequence
+            idx = torch.cat((idx, next_idx), dim=1)
+
+        return idx
 
 # Run inference
 model = GPT().to(device)
@@ -162,5 +215,5 @@ prompt = "ELIOT"
 context = encode(prompt).unsqueeze(0).to(device)
 
 with torch.no_grad():
-    output = model.generate(context, max_new_tokens=500, temperature=1.0)
+    output = model.generate2(context, max_new_tokens=500, temperature=1.0)
     print(decode(output[0].tolist()))

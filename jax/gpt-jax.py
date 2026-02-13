@@ -3,7 +3,6 @@ import jax.numpy as jnp
 import jax.random as jrandom
 import flax.linen as nn
 import optax
-from orbax.checkpoint import PyTreeCheckpointer
 import orbax.checkpoint as ocp
 from dataclasses import dataclass
 import time
@@ -15,18 +14,18 @@ from pathlib import Path
 
 # JAX Performance Flags
 # Enable XLA optimizations for GPU
+# These flags are useful for nvidia GPUs
 os.environ['XLA_FLAGS'] = (
     '--xla_gpu_enable_triton_gemm=true '
     '--xla_gpu_enable_cudnn_fmha=true '
-    #'--xla_gpu_enable_async_collectives=true'
 )
 # Ensure 32-bit mode (not 64-bit which is slower)
-jax.config.update('jax_enable_x64', False)
+# jax.config.update('jax_enable_x64', False)
 # Set default matmul precision to bfloat16 for speed
 jax.config.update('jax_default_matmul_precision', 'bfloat16')
 # Enable persistent compilation cache (speeds up subsequent runs)
-jax.config.update('jax_compilation_cache_dir', '/tmp/jax_cache')
-jax.config.update('jax_persistent_cache_min_entry_size_bytes', -1)
+# jax.config.update('jax_compilation_cache_dir', '/tmp/jax_cache')
+# jax.config.update('jax_persistent_cache_min_entry_size_bytes', -1)
 PARAM_DTYPE = jnp.float32 # Weights are stored in float32
 COMPUTE_DTYPE = jnp.bfloat16 # Computations are performed in bfloat16
 # This matches PyTorch's autocast behavior: matmuls, convs, and LayerNorm in bfloat16
@@ -44,8 +43,8 @@ class GPTConfig:
 
 @dataclass
 class TrainingConfig:
-    epochs: int = 1000
-    eval_interval: int = 500
+    epochs: int = 5000
+    eval_interval: int = 1000
     eval_epochs: int = 200
     max_lr: float = 3e-4
     min_lr: float = 3e-5 
@@ -127,10 +126,22 @@ class MultiHeadAttention(nn.Module):
         # kernels that run in O(T) memory. This matches PyTorch's F.scaled_dot_product_attention.
         # Note: attention-weight dropout is not supported here — we rely on the projection
         # dropout below (nn.Dropout after the output Dense), which is the modern convention.
-        out = jax.nn.dot_product_attention(
+        # If you want dropout you could use the jax.linen.dot_product_attention wrapper
+        # But it doesn't have the Flash Attention support.
+        mask = jnp.tril(jnp.ones((1, 1, T, T), dtype=bool))
+        out = nn.dot_product_attention(
             q, k, v, 
-            is_causal=True,
+            mask = mask,
+            deterministic=not train,
+            dropout_rate = self.dropout if train else 0.0,
+            dropout_rng = self.make_rng("dropout"),
         ) # (B, T, nh, hs) same layout as input
+
+        # out = jax.nn.dot_product_attention(
+        #     q, k, v, 
+        #     is_causal=True,
+        #     implementation='cudnn'
+        # )
         out = out.reshape(B, T, C) # (B, T, C)
 
         out = nn.Dense(
@@ -263,9 +274,9 @@ def make_train_step(model, tx):
 
 def make_eval_step(model):
     @jax.jit
-    def eval_step(params, x, y):
+    def eval_step(params, x, y, dropout_key):
         # train = false, deterministic = true, no dropout & rngs needed
-        logits = model.apply(params, x, train=False)
+        logits = model.apply(params, x, train=False, rngs={"dropout": dropout_key})
         logits = logits.astype(jnp.float32)
         loss = optax.softmax_cross_entropy_with_integer_labels(
             logits.reshape(-1, logits.shape[-1]),
@@ -279,9 +290,9 @@ def estimate_loss(eval_step_fn, params, key, train_data, val_data, config, train
     for split_name in ['train', 'val']:
         losses = []
         for _ in range(training_config.eval_epochs):
-            key, batch_key = jrandom.split(key)
+            key, batch_key, dropout_key = jrandom.split(key, 3)
             x, y = get_batch(batch_key, split_name, train_data, val_data, config)
-            loss = eval_step_fn(params, x, y)
+            loss = eval_step_fn(params, x, y, dropout_key)
             losses.append(loss)
         losses = jnp.stack(losses)
         out[split_name] = losses.mean().item()
@@ -307,8 +318,8 @@ def generate(model, params, key, idx, max_new_tokens, config, temperature=1.0):
         else:
             idx_cond = idx[:, -config.block_size:]
 
-        # no need for dropout or rng
-        logits = model.apply(params, idx_cond, train=False)
+        key, dropout_key = jrandom.split(key)
+        logits = model.apply(params, idx_cond, train=False, rngs={"dropout": dropout_key})
         logits = logits.astype(jnp.float32)
         logits = logits[:, -1, :] / temperature
 
@@ -331,23 +342,23 @@ def train():
     config = GPTConfig()
     key = jrandom.PRNGKey(training_config.seed)
 
-    # wandb.init(
-    #     project="gpt-run",
-    #     name=f"jax_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-    #     config={
-    #         'batch_size': config.batch_size,    
-    #         'block_size': config.block_size,
-    #         'epochs': training_config.epochs,
-    #         'eval_interval': training_config.eval_interval,
-    #         'max_lr': training_config.max_lr,
-    #         'min_lr': training_config.min_lr,
-    #         'warmup_epochs': training_config.warmup_epochs,
-    #         'n_embed': config.n_embed,
-    #         'num_heads': config.num_heads,
-    #         'num_layers': config.num_layers,    
-    #         'dropout': config.dropout,
-    #     }
-    # )
+    wandb.init(
+        project="gpt-run",
+        name=f"jax_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        config={
+            'batch_size': config.batch_size,    
+            'block_size': config.block_size,
+            'epochs': training_config.epochs,
+            'eval_interval': training_config.eval_interval,
+            'max_lr': training_config.max_lr,
+            'min_lr': training_config.min_lr,
+            'warmup_epochs': training_config.warmup_epochs,
+            'n_embed': config.n_embed,
+            'num_heads': config.num_heads,
+            'num_layers': config.num_layers,    
+            'dropout': config.dropout,
+        }
+    )
 
     # Data loading
     with open("input.txt", "r", encoding="utf-8") as f:
@@ -369,24 +380,24 @@ def train():
     print(f"Total Validation tokens: {len(val_data) // 1e3:.2f}K")
 
     # Checkpointer setup
-    # ckpt_dir = str(Path("checkpoints/gpt-jax").resolve())
-    # os.makedirs(ckpt_dir, exist_ok=True)
+    ckpt_dir = str(Path("checkpoints/gpt-jax").resolve())
+    os.makedirs(ckpt_dir, exist_ok=True)
 
-    # options = ocp.CheckpointManagerOptions(
-    #     max_to_keep=3,
-    #     create=True,
-    #     enable_async_checkpointing=True,
-    # )
+    options = ocp.CheckpointManagerOptions(
+        max_to_keep=3,
+        create=True,
+        enable_async_checkpointing=True,
+    )
 
-    # ckpt_manager = ocp.CheckpointManager(
-    #     ckpt_dir,
-    #     item_handlers={
-    #         "params": ocp.PyTreeCheckpointHandler(),
-    #         "opt_state": ocp.PyTreeCheckpointHandler(),
-    #         "step": ocp.JsonCheckpointHandler(),
-    #     },
-    #     options=options,
-    # )
+    ckpt_manager = ocp.CheckpointManager(
+        ckpt_dir,
+        item_handlers={
+            "params": ocp.PyTreeCheckpointHandler(),
+            "opt_state": ocp.PyTreeCheckpointHandler(),
+            "step": ocp.JsonCheckpointHandler(),
+        },
+        options=options,
+    )
 
     # Model init
     model = GPT(vocab_size=vocab_size, config=config)
@@ -394,7 +405,6 @@ def train():
     dummy_x = jnp.ones((1, config.block_size), dtype=jnp.int32)
     params = model.init(init_key, dummy_x, train=False)
     print("Layer names: ", params['params'].keys())
-    #print(params['params']['Block_0']['MultiHeadAttention_0'])
     
     num_params = sum(p.size for p in jax.tree_util.tree_leaves(params))
     print(f"Number of parameters: {num_params/1e6:.4f}M")
@@ -443,17 +453,18 @@ def train():
 
     # Train
     start_time = time.time()
-    #for step in tqdm.trange(start_step, training_config.epochs, desc="Training"):
-    for step in range(start_step, training_config.epochs):
+    for step in tqdm.trange(start_step, training_config.epochs, desc="Training"):
+    #for step in range(start_step, training_config.epochs):
         t0 = time.time()
         
         # Periodic evaluation
-        # if step % training_config.eval_interval == 0:
-        #     losses, key = estimate_loss(
-        #         eval_step_fn, params, key,
-        #         train_data, val_data, config, training_config,
-        #     )
-        #     print(f"\nStep {step}: train {losses['train']:.4f}, val {losses['val']:.4f}")
+        if step % training_config.eval_interval == 0:
+            losses, key = estimate_loss(
+                eval_step_fn, params, key,
+                train_data, val_data, config, training_config,
+            )
+            wandb.log(losses | {"step": step})
+            # print(f"\nStep {step}: train {losses['train']:.4f}, val {losses['val']:.4f}")
 
             # # Save checkpoint
             # ckpt_manager.save(
@@ -470,12 +481,13 @@ def train():
         x, y = get_batch(batch_key, "train", train_data, val_data, config)
 
         loss, params, opt_state = train_step_fn(params, opt_state, x, y, dropout_key)
-        loss.block_until_ready()
+        # loss.block_until_ready() # async requests sync
         
         t1 = time.time()
         dt_ms = (t1 - t0) * 1000
         tokens_per_sec = config.batch_size * config.block_size / (t1 - t0)
-        print(f"step {step} | loss {loss:.4f} | dt {dt_ms:.2f}ms | tok/sec {tokens_per_sec:.2f}")
+        wandb.log({"time_per_step_in_ms": dt_ms, "tokens_per_second": tokens_per_sec})
+        # print(f"step {step} | loss {loss:.4f} | dt {dt_ms:.2f}ms | tok/sec {tokens_per_sec:.2f}")
 
     elapsed = time.time() - start_time
     print(f"\nTraining time: {elapsed:.2f}s")
@@ -488,22 +500,22 @@ def train():
     print(f"Final — train: {losses['train']:.4f}, val: {losses['val']:.4f}")
 
     # Generate
-    # key, gen_key = jrandom.split(key)
-    # context = jnp.zeros((1, 1), dtype=jnp.int32)
-    # generated = generate(model, params, gen_key, context, 500, config)
-    # print(decode(generated[0].tolist()))
+    key, gen_key = jrandom.split(key)
+    context = jnp.zeros((1, 1), dtype=jnp.int32)
+    generated = generate(model, params, gen_key, context, 500, config)
+    print(decode(generated[0].tolist()))
 
     # Save the final checkpoint
-    # ckpt_manager.save(
-    #     training_config.epochs,
-    #     {
-    #         "params": params,
-    #         "opt_state": opt_state,
-    #         "step": training_config.epochs,
-    #     }
-    # )
-    # print(f"Final checkpoint saved to {ckpt_dir}")
-    # ckpt_manager.wait_until_finished()
+    ckpt_manager.save(
+        training_config.epochs,
+        {
+            "params": params,
+            "opt_state": opt_state,
+            "step": training_config.epochs,
+        }
+    )
+    print(f"Final checkpoint saved to {ckpt_dir}")
+    ckpt_manager.wait_until_finished()
 
 if __name__ == "__main__":
     train()

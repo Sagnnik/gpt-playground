@@ -10,3 +10,5 @@ wheels/
 .venv
 checkpoints/
 wandb/
+.ruff_cache/
+*.ipynb_checkpoints
