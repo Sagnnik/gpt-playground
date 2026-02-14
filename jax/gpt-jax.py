@@ -481,7 +481,7 @@ def train():
         x, y = get_batch(batch_key, "train", train_data, val_data, config)
 
         loss, params, opt_state = train_step_fn(params, opt_state, x, y, dropout_key)
-        # loss.block_until_ready() # async requests sync
+        loss.block_until_ready() # async requests sync
         
         t1 = time.time()
         dt_ms = (t1 - t0) * 1000
