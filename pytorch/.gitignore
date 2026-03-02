@@ -10,3 +10,5 @@ wheels/
 .venv
 checkpoints/
 wandb/
+pt_trace/
+gpt-profiler.py
