@@ -12,3 +12,5 @@ checkpoints/
 wandb/
 .ruff_cache/
 *.ipynb_checkpoints
+jax_trace/
+profiler.py
