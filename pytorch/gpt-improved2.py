@@ -112,38 +112,55 @@ val_ds = TinyShakespeareDataset(split='val', block_size=block_size)
 train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
-# Functional implementation of RoPE
-# def get_inv_freq(head_dim, base=10000):
-#     # Calculating the w(i) value
-#     n_pairs = head_dim // 2 # Number of pairs
-#     i = torch.arange(n_pairs, dtype=torch.float32) # vector of pairs
-#     return 1.0/(base ** (i/n_pairs))
+"""
+Functional implementation of RoPE:
 
-# def get_angles(seq_len, inv_freq):
-#     # Calculating the angles
-#     pos = torch.arange(seq_len, dtype=torch.float32)
-#     return torch.outer(pos, inv_freq)
+STEP 1: Angle definition
+theta(p, i) = p / 10000^(2i/d)
 
-# def apply_rope(x, inv_freq):
-#     # x shape: (batch, num_heads, seq_len, dim)
-#     B, H, L, D = x.shape
-#     n_pairs = D // 2
-#     inv_freq = get_inv_freq(D, 10000)
-#     angles = get_angles(L, inv_freq)
+STEP 2: Pairwise Rotation
+q = [x1 x2 x3 x4]
+we group, 
+i=0 -> (x1 x2) and i=1 -> (x3 x4)
 
-#     sin = torch.sin(angles)[None, None, :, :] # (1, 1, seq_len, head_dim//2)
-#     cos = torch.cos(angles)[None, None, :, :] # (1, 1, seq_len, head_dim//2)
+for pair i,
+[x1'] = Ri . [x1]  
+[x2']        [x2]
 
-#     # Split the X into two parts
-#     x1 = x[..., :n_pairs]
-#     x2 = x[..., n_pairs:]
+=> [x1'] = [x1cos(theta) - x2sin(theta)]  
+   [x2']   [x1sin(theta) + x2cos(theta)]
 
-#     # Calculating the xRi matrix
-#     rot1 = x1 * cos - x2 * sin
-#     rot2 = x1 * sin + x2 * cos
+def get_inv_freq(head_dim, base=10000):
+    # Calculating the w(i) value
+    n_pairs = head_dim // 2 # Number of pairs
+    i = torch.arange(n_pairs, dtype=torch.float32) # vector of pairs
+    return 1.0/(base ** (i/n_pairs))
 
-#     return torch.cat([rot1, rot2], dim=-1).to(dtype=x.dtype)
+def get_angles(seq_len, inv_freq):
+    # Calculating the angles
+    pos = torch.arange(seq_len, dtype=torch.float32)
+    return torch.outer(pos, inv_freq)
 
+def apply_rope(x, inv_freq):
+    # x shape: (batch, num_heads, seq_len, dim)
+    B, H, L, D = x.shape
+    n_pairs = D // 2
+    inv_freq = get_inv_freq(D, 10000)
+    angles = get_angles(L, inv_freq)
+
+    sin = torch.sin(angles)[None, None, :, :] # (1, 1, seq_len, head_dim//2)
+    cos = torch.cos(angles)[None, None, :, :] # (1, 1, seq_len, head_dim//2)
+
+    # Split the X into two parts
+    x1 = x[..., :n_pairs]
+    x2 = x[..., n_pairs:]
+
+    # Calculating the xRi matrix
+    rot1 = x1 * cos - x2 * sin
+    rot2 = x1 * sin + x2 * cos
+
+    return torch.cat([rot1, rot2], dim=-1).to(dtype=x.dtype)
+"""
 # RoPE class
 class RotaryEmbedding(nn.Module):
     def __init__(self, head_dim, base=10000, max_positions=2048):
@@ -197,8 +214,50 @@ class RotaryEmbedding(nn.Module):
         rot2 = x1 * sin + x2 * cos
 
         return torch.cat([rot1, rot2], dim=-1).to(dtype=x.dtype)
+
+"""
+    RMSNorm
+
+    From pytorch docs,
     
+    y(i) = x(i) * gamma(i) / RMS(x)
 
+    where, 
+    RMS(x) = sqrt(1/n*sum(x^2) + eps)
+=>  RMS(x) = sqrt(mean(x^2) + eps)
 
+    BatchNorm -> normalizes across the batch dimension
+    LayerNorm -> normalizes across the feature dimension
+    RMSNorm -> like LayerNorm, but without subtracting the mean
 
+    Mean shift is unecessary as the model can learn to adapt to the mean shift
+"""   
+class RMSNorm(nn.Module):
+    def __init__(self, n_embed, eps=1e-6, bias=False):
+        super().__init__()
+        self.eps = eps
+
+        # Pytorch initializes gamma with ones. Google's models use zero initialization and later uses (1.0 + self.gamma)
+        self.gamma = nn.Parameter(torch.zeros(n_embed))
+        # This is optional as LLMs generally do not use bias
+        self.bias = nn.Parameter(torch.zeros(n_embed)) if bias else None
+
+    def forward(self, x):
+        input_dtype = x.dtype
+        x_f = x.float() # float32
+        var = x_f.pow(2).mean(dim=-1, keepdim=True)
+        x_norm = x_f * torch.rsqrt(var + self.eps) # rsqrt = 1/sqrt
+        
+        out = x_norm * (1.0 + self.gamma.float())
+
+        if self.bias is not None:
+            out += self.bias.float()
+
+        return out.to(input_dtype)
+
+class GroupedQueryAttention(nn.Module):
+    """
+    GQA reduces memory by sharing the key-value heads across multiple query heads
+    This has similar performace with MHA but more efficient
+    """
 

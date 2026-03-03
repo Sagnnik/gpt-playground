@@ -8,7 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+.env
 checkpoints/
 wandb/
 pt_trace/
 gpt-profiler.py
+saved_models/
