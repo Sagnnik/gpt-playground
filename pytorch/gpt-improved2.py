@@ -112,7 +112,91 @@ val_ds = TinyShakespeareDataset(split='val', block_size=block_size)
 train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
+# Functional implementation of RoPE
+# def get_inv_freq(head_dim, base=10000):
+#     # Calculating the w(i) value
+#     n_pairs = head_dim // 2 # Number of pairs
+#     i = torch.arange(n_pairs, dtype=torch.float32) # vector of pairs
+#     return 1.0/(base ** (i/n_pairs))
 
+# def get_angles(seq_len, inv_freq):
+#     # Calculating the angles
+#     pos = torch.arange(seq_len, dtype=torch.float32)
+#     return torch.outer(pos, inv_freq)
+
+# def apply_rope(x, inv_freq):
+#     # x shape: (batch, num_heads, seq_len, dim)
+#     B, H, L, D = x.shape
+#     n_pairs = D // 2
+#     inv_freq = get_inv_freq(D, 10000)
+#     angles = get_angles(L, inv_freq)
+
+#     sin = torch.sin(angles)[None, None, :, :] # (1, 1, seq_len, head_dim//2)
+#     cos = torch.cos(angles)[None, None, :, :] # (1, 1, seq_len, head_dim//2)
+
+#     # Split the X into two parts
+#     x1 = x[..., :n_pairs]
+#     x2 = x[..., n_pairs:]
+
+#     # Calculating the xRi matrix
+#     rot1 = x1 * cos - x2 * sin
+#     rot2 = x1 * sin + x2 * cos
+
+#     return torch.cat([rot1, rot2], dim=-1).to(dtype=x.dtype)
+
+# RoPE class
+class RotaryEmbedding(nn.Module):
+    def __init__(self, head_dim, base=10000, max_positions=2048):
+        super().__init__()
+        assert head_dim % 2 == 0, "Head dimension must be even"
+        self.head_dim = head_dim
+        self.base = base
+        self.max_positions = max_positions
+
+        # Precompute Inverse Frequencies
+        half_dim = head_dim // 2
+        inv_freq = 1.0 / (base ** (torch.arange(half_dim, dtype=torch.float32) / half_dim))
+
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+        # Precompute sin/cos cache
+        self.build_cache(max_positions)
+
+    def build_cache(self, seq_len):
+        positions = torch.arange(seq_len, dtype=torch.float32)
+        angles = torch.outer(positions, self.inv_freq)
+
+        cos = torch.cos(angles)
+        sin = torch.sin(angles)
+
+        self.register_buffer("cos_cached", cos, persistent=False)
+        self.register_buffer("sin_cached", sin, persistent=False)
+
+    def forward(self, x, position_offset=0):
+        # x shape: (batch, num_heads, seq_len, head_dim)
+        B, H, L, D = x.shape
+        assert D == self.head_dim
+
+        # Extending the cache if necessary
+        if position_offset + L > self.cos_cached.shape[0]:
+            self.build_cache(position_offset + L)
+
+        # This selects exactly the angles corresponding to the true token positions (useful for KV-cache)
+        cos = self.cos_cached[position_offset:position_offset+L]
+        sin = self.sin_cached[position_offset:position_offset+L]
+
+        cos = cos[None, None, :, :] # (1, 1, seq_len, head_dim//2)
+        sin = sin[None, None, :, :] # (1, 1, seq_len, head_dim//2)
+
+        # Split the X into two parts
+        x1 = x[..., :D//2]
+        x2 = x[..., D//2:]
+
+        # Calculating the xRi matrix
+        rot1 = x1 * cos - x2 * sin
+        rot2 = x1 * sin + x2 * cos
+
+        return torch.cat([rot1, rot2], dim=-1).to(dtype=x.dtype)
     
 
 
