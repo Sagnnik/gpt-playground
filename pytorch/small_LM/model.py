@@ -1,14 +1,17 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention.flex_attention import flex_attention, create_block_mask
 import tiktoken
 from torch.utils.data import Dataset, DataLoader
 from torch.amp import autocast
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 import time
 import wandb
 from datetime import datetime
+from copy import deepcopy
+
 
 # Performance Flags
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -30,7 +33,7 @@ torch.cuda.manual_seed_all(1337)
 # "d_model": 1024,
 # "intermediate_dim": 3584 (3.5x expansion for SwiGLU. Optimized for 256-bit alignment) 
 # "attention_heads": 16Q / 4KV
-# "vocab_size": 50304(gpt-2) or 68k (Sarvam tokenizer)
+# "vocab_size": 50304(gpt-2) or 65536 (LFM-2.5 tok) or 68k (Sarvam tok)
 # "weight_tying": true,
 # "max_context": 4096
 # }
@@ -40,65 +43,85 @@ torch.cuda.manual_seed_all(1337)
 # Hyperparams
 @dataclass
 class ModelConfig:
-    batch_size: int = 24
-    seq_length: int = 256
     vocab_size: int = 50304
-    n_embed: int = 384
-    num_heads: int = 8
-    n_layer: int = 4
-    num_kv_heads: int = 4 # For Grouped Query Attention
-    sliding_window: int = 4096
-    intermediate_dim: 3584 # SwiGLU expansion
+    seq_length: int = 512
+    n_embed: int = 1024
+    intermediate_dim: int = 3584      # ~3.5x expansion, 256-bit aligned
+    num_heads: int = 16
+    num_kv_heads: int = 8
+    num_layers: int = 16
+    head_dim: int = 64
+ 
+    # Architecture
+    sliding_window: int = 512
+    max_position_embeddings: int = 4096
+    norm_eps: float = 1e-5
     qk_norm: bool = True
     query_pre_attn_scalar: float = 1.0
+ 
+    # RoPE
+    rope_theta_local: float = 10000.0
+    rope_theta_global: float = 1000000.0
+ 
+    # FFN
+    use_swiglu: bool = True
 
-    # Training configs
-    gradient_accumulation_steps: int = 4
-    muon_lr: float = 0.01
-    weight_decay: float = 0.1
-    dropout: float = 0.2
-    grad_clip: float = 1.0
-    use_amp: bool = True
-
-    # Eval Configs
-    eval_interval: int = 1000
-    eval_epochs: int = 200
-
+    
+    layer_types: list = field(default_factory=lambda: [
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "sliding_attention",
+        "full_attention",
+    ])
+ 
+    # Training
+    batch_size: int = 8
+    learning_rate: float = 3e-4
+    dropout: float = 0.0
+ 
+ 
 config = ModelConfig()
+
 # Loading dataset
+if not os.path.exists('input.txt'):
+    print("Downloading tiny shakespeare dataset...")
+    import requests
+    url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+    with open('input.txt', 'w', encoding='utf-8') as f:
+        f.write(requests.get(url).text)
+ 
 with open('input.txt', 'r', encoding='utf-8') as f:
     text = f.read()
-
-enc = tiktoken.get_encoding("gpt-2")
+ 
+enc = tiktoken.get_encoding("gpt2")
 tokens = torch.tensor(enc.encode(text), dtype=torch.long)
-
-# enc = tiktoken.get_encoding("gpt-2")
-# vocab_size = enc.n_vocab
-# print(f"Vocab Size: {vocab_size}")
-# import sys; sys.exit()
-
-# def encode(s): return torch.tensor(enc.encode(s), dtype=torch.long)
-# def decode(t): return enc.decode(t.tolist())
-
-# data = encode(text)
-# split = int(0.9*len(data))
-# train_data = data[:split]
-# val_data = data[split:]
-# print(f"Total Training tokens: {len(train_data) // 1000:.2f}K")
-# print(f"Total Validation tokens: {len(val_data) // 1000:.2f}K")
+ 
+split = int(0.9 * len(tokens))
+print(f"Total Training tokens: {split // 1000:.2f}K")
+print(f"Total Validation tokens: {(len(tokens) - split) // 1000:.2f}K")
 
 class TinyShakespeareDataset(Dataset):
-    def __init__(self, tokens, split='train', block_size=128, train_ratio=0.9):
-        self.text = text
+    def __init__(self, tokens, split='train', train_ratio=0.9, block_size=512):
         self.tokens = tokens
+        self.block_size = block_size
 
         n = int(train_ratio * len(self.tokens))
         if split == 'train':
             self.data = self.tokens[:n]
         else:
             self.data = self.tokens[n:]
-            
-        self.block_size = block_size
 
     def __len__(self):
         return len(self.data) - self.block_size
@@ -169,7 +192,7 @@ def apply_rope(x, inv_freq):
 """
 # RoPE class
 class RotaryEmbedding(nn.Module):
-    def __init__(self, head_dim, base=10000, max_positions=2048):
+    def __init__(self, head_dim, base=10000, max_positions=4096):
         super().__init__()
         assert head_dim % 2 == 0, "Head dimension must be even"
         self.head_dim = head_dim
@@ -179,13 +202,12 @@ class RotaryEmbedding(nn.Module):
         # Precompute Inverse Frequencies
         half_dim = head_dim // 2
         inv_freq = 1.0 / (base ** (torch.arange(half_dim, dtype=torch.float32) / half_dim))
-
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
         # Precompute sin/cos cache
-        self.build_cache(max_positions)
+        self._build_cache(max_positions)
 
-    def build_cache(self, seq_len):
+    def _build_cache(self, seq_len):
         positions = torch.arange(seq_len, dtype=torch.float32)
         angles = torch.outer(positions, self.inv_freq)
 
@@ -195,14 +217,14 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("cos_cached", cos, persistent=False)
         self.register_buffer("sin_cached", sin, persistent=False)
 
-    def forward(self, x, position_offset=0):
+    def forward(self, x:torch.Tensor, position_offset=0):
         # x shape: (batch, num_heads, seq_len, head_dim)
         B, H, L, D = x.shape
         assert D == self.head_dim
 
         # Extending the cache if necessary
         if position_offset + L > self.cos_cached.shape[0]:
-            self.build_cache(position_offset + L)
+            self._build_cache(position_offset + L)
 
         # This selects exactly the angles corresponding to the true token positions (useful for KV-cache)
         cos = self.cos_cached[position_offset:position_offset+L]
@@ -219,7 +241,7 @@ class RotaryEmbedding(nn.Module):
         rot1 = x1 * cos - x2 * sin
         rot2 = x1 * sin + x2 * cos
 
-        return torch.cat([rot1, rot2], dim=-1).to(dtype=x.dtype)
+        return torch.cat([rot1, rot2], dim=-1).to(x.dtype)
 
 """
     RMSNorm
@@ -250,69 +272,20 @@ class RMSNorm(nn.Module):
 
     def forward(self, x):
         input_dtype = x.dtype
-        x_f = x.float() # float32
+        x_f = x.float()
         var = x_f.pow(2).mean(dim=-1, keepdim=True)
-        x_norm = x_f * torch.rsqrt(var + self.eps) # rsqrt = 1/sqrt
-        
+        x_norm = x_f * torch.rsqrt(var + self.eps)
         out = x_norm * (1.0 + self.gamma.float())
-
         if self.bias is not None:
-            out += self.bias.float()
-
+            out = out + self.bias.float()
         return out.to(input_dtype)
-
-# Qwen3ForCausalLM(
-#   (model): Qwen3Model(
-#     (embed_tokens): Embedding(151936, 1024)
-#     (layers): ModuleList(
-#       (0-27): 28 x Qwen3DecoderLayer(
-#         (self_attn): Qwen3Attention(
-#           (q_proj): Linear(in_features=1024, out_features=2048, bias=False)
-#           (k_proj): Linear(in_features=1024, out_features=1024, bias=False)
-#           (v_proj): Linear(in_features=1024, out_features=1024, bias=False)
-#           (o_proj): Linear(in_features=2048, out_features=1024, bias=False)
-#           (q_norm): Qwen3RMSNorm((128,), eps=1e-06)
-#           (k_norm): Qwen3RMSNorm((128,), eps=1e-06)
-#         )
-#         (mlp): Qwen3MLP(
-#           (gate_proj): Linear(in_features=1024, out_features=3072, bias=False)
-#           (up_proj): Linear(in_features=1024, out_features=3072, bias=False)
-#           (down_proj): Linear(in_features=3072, out_features=1024, bias=False)
-#           (act_fn): SiLUActivation()
-#         )
-#         (input_layernorm): Qwen3RMSNorm((1024,), eps=1e-06)
-#         (post_attention_layernorm): Qwen3RMSNorm((1024,), eps=1e-06)
-#       )
-#     )
-#     (norm): Qwen3RMSNorm((1024,), eps=1e-06)
-#     (rotary_emb): Qwen3RotaryEmbedding()
-#   )
-#   (lm_head): Linear(in_features=1024, out_features=151936, bias=False)
-# )
-# Lfm2DecoderLayer(
-#   (self_attn): Lfm2Attention(
-#     (q_proj): Linear(in_features=1024, out_features=1024, bias=False)
-#     (k_proj): Linear(in_features=1024, out_features=512, bias=False)
-#     (v_proj): Linear(in_features=1024, out_features=512, bias=False)
-#     (out_proj): Linear(in_features=1024, out_features=1024, bias=False)
-#     (q_layernorm): Lfm2RMSNorm((64,), eps=1e-05)
-#     (k_layernorm): Lfm2RMSNorm((64,), eps=1e-05)
-#   )
-#   (feed_forward): Lfm2MLP(
-#     (w1): Linear(in_features=1024, out_features=4608, bias=False)
-#     (w3): Linear(in_features=1024, out_features=4608, bias=False)
-#     (w2): Linear(in_features=4608, out_features=1024, bias=False)
-#   )
-#   (operator_norm): Lfm2RMSNorm((1024,), eps=1e-05)
-#   (ffn_norm): Lfm2RMSNorm((1024,), eps=1e-05)
-# )
 
 class GroupedQueryAttention(nn.Module):
     """
     GQA reduces memory by sharing the key-value heads across multiple query heads
     This has similar performace with MHA but more efficient
 
-    1. QK-Norm
+    -> QK-Norm
         Q' = RMSNorm(Q)
         K' = RMSNorm(K)
         Attention = Q'K'T/sqrt(d_in)
@@ -326,19 +299,30 @@ class GroupedQueryAttention(nn.Module):
         with RMSNorm magnitude remains stable
     """
 
-    def __init__(self, d_in, num_heads, num_kv_heads, head_dim=None, qk_norm=False, query_pre_attn_scalar=None):
+    def __init__(self, 
+        d_in, 
+        num_heads, 
+        num_kv_heads, 
+        head_dim=None,
+        qk_norm=False, 
+        rope_base=10000.0, 
+        query_pre_attn_scalar=None):
+
         super().__init__()
         assert num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_groups"
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.group_size = num_heads // num_kv_heads
-        self.rope = RotaryEmbedding(head_dim)
+        
 
         if head_dim is None:
             assert d_in % num_heads == 0, "d_in must be divisible by num_heads"
             head_dim = d_in // num_heads
-        
+
         self.head_dim = head_dim
+        # Each GQA head has its own RoPE and it's own buffers
+        self.rope = RotaryEmbedding(head_dim, base=rope_base)
+        
 
         # Q => num_heads, K => num_kv_heads, V => num_kv_groups
         # k_proj and v_proj can be done in 1 linear layer
@@ -364,20 +348,19 @@ class GroupedQueryAttention(nn.Module):
     def forward(self, x, mask):
         # x shape: (B, T, d_in)
 
-        b, num_tokens, _ = x.shape
+        B, T, _ = x.shape
 
         queries = self.q_proj(x) # (B, T, num_heads * head_dim)
         keys = self.k_proj(x) # (B, T, num_kv_heads * head_dim)
         values = self.v_proj(x) # (B, T, num_kv_heads * head_dim)
 
         # Reshape to (B, num_heads/num_kv_heads, T, head_dim)
-        queries = queries.view(b, num_tokens, self.num_heads, self.head_dim).transpose(1, 2)
-        keys = keys.view(b, num_tokens, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        values = values.view(b, num_tokens, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        queries = queries.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        keys = keys.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        values = values.view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
 
         if self.q_norm is not None:
             queries = self.q_norm(queries)
-        if self.k_norm is not None:
             keys = self.k_norm(keys)
 
         # Apply RoPE to queries and keys
@@ -391,8 +374,11 @@ class GroupedQueryAttention(nn.Module):
         # Scaling queries (1/sqrt(d))
         queries = queries * self.scaling
 
-        out = F.scaled_dot_product_attention(queries, keys, values, is_causal=True) # (B, num_heads, T, head_dim)
-        out = out.transpose(1, 2).contiguous().view(b, num_tokens, -1) # (B, T, num_heads * head_dim)
+        if mask is not None:
+            out = F.scaled_dot_product_attention(queries, keys, values, attn_mask=mask, is_causal=False)
+        else:
+            out = F.scaled_dot_product_attention(queries, keys, values, is_causal=True) # (B, num_heads, T, head_dim)
+        out = out.transpose(1, 2).contiguous().view(B, T, -1) # (B, T, num_heads * head_dim)
         out = self.o_proj(out)
         return out
 
@@ -420,35 +406,198 @@ class FeedForward(nn.Module):
         super().__init__()
         hidden_dim = cfg.intermediate_dim
         # w1 and w3 can be done in 1 linear layer
-        self.w1 = nn.Linear(cfg.n_embed, hidden_dim, bias=False)
-        self.w2 = nn.Linear(hidden_dim, cfg.n_embed, bias=False)
-        self.w3 = nn.Linear(cfg.n_embed, hidden_dim, bias=False)
+        self.w1 = nn.Linear(cfg.n_embed, hidden_dim, bias=False)  # gate
+        self.w2 = nn.Linear(hidden_dim,  cfg.n_embed, bias=False)  # output
+        self.w3 = nn.Linear(cfg.n_embed, hidden_dim, bias=False)  # value
 
     def forward(self, x):
-        gate = self.w1(x)
-        value = self.w3(x)
-        swiglu = self.w2(F.silu(gate) * value)
-        return swiglu
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
     
 class TransformerBlock(nn.Module):
     def __init__(self, cfg:ModelConfig, attn_type:str):
         super().__init__()
-        self.attn_type = attn_type # 'attention' or 'conv'
+        self.attn_type = attn_type #  'sliding_attention' or 'full_attention' or 'conv'
+
+        rope_base = cfg.rope_theta_local if attn_type == "sliding_attention" else cfg.rope_theta_global
+
         self.attention = GroupedQueryAttention(
             d_in=cfg.n_embed,
             num_heads=cfg.num_heads,
             num_kv_heads=cfg.num_kv_heads,
             qk_norm=cfg.qk_norm,
             query_pre_attn_scalar=cfg.query_pre_attn_scalar,
+            head_dim=cfg.head_dim,
+            rope_base=rope_base
         )
 
         self.ffn = FeedForward(cfg)
-        self.input_layernorm = RMSNorm(n_embed=cfg.n_embed)
-        self.post_attention_layernorm = RMSNorm(n_embed=cfg.n_embed)
-        self.pre_feedforward_layernorm = RMSNorm(n_embed=cfg.n_embed)
-        self.post_feedforward_layernorm = RMSNorm(n_embed=cfg.n_embed)
+        self.input_layernorm = RMSNorm(cfg.n_embed, eps=cfg.norm_eps)
+        self.post_attention_layernorm = RMSNorm(cfg.n_embed, eps=cfg.norm_eps)
+        self.pre_feedforward_layernorm = RMSNorm(cfg.n_embed, eps=cfg.norm_eps)
+        self.post_feedforward_layernorm = RMSNorm(cfg.n_embed, eps=cfg.norm_eps)
 
-    def forward(self, x):
-        pass
+        # LFM uses Residual scaling for every last linear layer
+        # Residual scaling: std = 0.02 / sqrt(2 * num_layers)
+        residual_std = 0.02 / (2 * cfg.num_layers) ** 0.5
+        nn.init.normal_(self.attention.o_proj.weight, std=residual_std)
+        nn.init.normal_(self.ffn.w2.weight, std=residual_std)
+
+    def forward(self, x, mask_global, mask_local):
+        attn_mask = mask_local if self.attn_type == "sliding_attention" else mask_global
+        
+        res = x
+        x   = self.input_layernorm(x)
+        x   = self.attention(x, attn_mask)
+        x   = self.post_attention_layernorm(x)
+        x   = res + x
+
+        res = x
+        x   = self.pre_feedforward_layernorm(x)
+        x   = self.ffn(x)
+        x   = self.post_feedforward_layernorm(x)
+        x   = res + x
+        return x
+
+class GPT(nn.Module):
+    def __init__(self, cfg:ModelConfig):
+        super().__init__()
+        assert cfg.layer_types is not None
+        assert len(cfg.layer_types) == cfg.num_layers
+        self.cfg = cfg
+
+        self.tok_embeddings = nn.Embedding(cfg.vocab_size, cfg.n_embed)
+
+        self.blocks = nn.ModuleList([
+            TransformerBlock(cfg, layer_type) for layer_type in cfg.layer_types
+        ])
+
+        self.final_norm = RMSNorm(cfg.n_embed, eps=cfg.norm_eps)
+        self.lm_head = nn.Linear(cfg.n_embed, cfg.vocab_size, bias=False)
+        # Weight tying
+        self.lm_head.weight = self.tok_embeddings.weight
+    #     self.apply(self._init_weights())
+
+    # def _init_weights(self, module):
+    #     if isinstance(module, nn.Linear):
+    #         torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+    #     elif isinstance(module, nn.Embedding):
+    #         torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def _create_mask(self, seq_len, device):
+        """
+        Returns additive float masks (0.0 = attend, -inf = block) for SDPA.
+
+        mask_global: causal (can't see future)
+            j:  0 1 2 3 4 5 6 7
+         i
+            0:  0 1 1 1 1 1 1 1
+            1:  0 0 1 1 1 1 1 1
+            2:  0 0 0 1 1 1 1 1
+            3:  0 0 0 0 1 1 1 1
+            4:  0 0 0 0 0 1 1 1
+            5:  0 0 0 0 0 0 1 1
+            6:  0 0 0 0 0 0 0 1
+            7:  0 0 0 0 0 0 0 0
+
+        far_past (too far back is masked: i - j >= sliding_window)
+        where sliding_window = 4
+            j:  0 1 2 3 4 5 6 7
+         i
+            0:  0 0 0 0 0 0 0 0
+            1:  0 0 0 0 0 0 0 0
+            2:  0 0 0 0 0 0 0 0
+            3:  0 0 0 0 0 0 0 0
+            4:  1 0 0 0 0 0 0 0
+            5:  1 1 0 0 0 0 0 0
+            6:  1 1 1 0 0 0 0 0
+            7:  1 1 1 1 0 0 0 0
+
+        Local (sliding_window): causal + sliding window (can't see too-far past either)
+        mask_local
+            j:  0 1 2 3 4 5 6 7
+        i
+        0:      0 1 1 1 1 1 1 1
+        1:      0 0 1 1 1 1 1 1
+        2:      0 0 0 1 1 1 1 1
+        3:      0 0 0 0 1 1 1 1
+        4:      1 0 0 0 0 1 1 1
+        5:      1 1 0 0 0 0 1 1
+        6:      1 1 1 0 0 0 0 1
+        7:      1 1 1 1 0 0 0 0
+        """
+
+        # Create a ones matrix
+        ones = torch.ones(seq_len, seq_len, dtype=torch.bool, device=device)
+        # Creat causal attention mask or global mask
+        causal = torch.triu(ones, diagonal=1) # future blocked
+        # Create a upper triangular matrix with a sliding window size then transpose it to get the mask for past tokens not inside sliding window
+        far_past = torch.triu(ones, diagonal=self.cfg.sliding_window).T  # too-far past blocked
+        # Combine the two masks to get the final local mask
+        local_bool = causal | far_past
+
+        # Need to make it suitable for torch SDPA
+        NEG_INF = float('-inf')
+        mask_global = torch.zeros(seq_len, seq_len, device=device)
+        mask_global.masked_fill_(causal, NEG_INF)
+
+        mask_local = torch.zeros(seq_len, seq_len, device=device)
+        mask_local.masked_fill_(local_bool, NEG_INF)
+
+        return mask_global, mask_local
+    
+    def forward(self, x: torch.Tensor, targets: torch.Tensor = None):
+        B, T = x.shape
+
+        # Gemma uses embedding scaling: x * sqrt(d_model)
+        # LFM/Qwen doesn't
+        x = self.tok_embeddings(x) * (self.cfg.n_embed ** 0.5)
+        #x = self.tok_embeddings(x)
+        mask_global, mask_local = self._create_mask(T, x.device)
+
+        for block in self.blocks:
+            x = block(x, mask_global=mask_global, mask_local=mask_local)
+            
+        x = self.final_norm(x)
+        logits = self.lm_head(x)
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
 
 
+# Test
+if __name__ == "__main__":
+
+    test_config = ModelConfig(
+        vocab_size=50304,
+        seq_length=64,
+        n_embed=128,
+        intermediate_dim=256,
+        num_heads=4,
+        num_kv_heads=2,
+        num_layers=2,
+        head_dim=32,
+        batch_size=2,
+        layer_types= ["sliding_attention","full_attention"]
+    )
+
+    print("Initialising model...")
+    model = GPT(test_config).to(device)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {total_params / 1e6:.2f}M")
+
+    dummy_input = torch.randint(
+        0,
+        test_config.vocab_size,
+        (test_config.batch_size, test_config.seq_length),
+        device=device
+    )
+
+    print("Testing forward pass...")
+    logits, loss = model(dummy_input, targets=dummy_input)
+
+    print(f"Output logits shape: {logits.shape}")
+    print(f"Loss: {loss.item():.4f}")
+    print("All checks passed!")
